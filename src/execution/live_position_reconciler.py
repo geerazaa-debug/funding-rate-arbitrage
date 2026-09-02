@@ -30,6 +30,26 @@ class PositionMismatch:
     severity: str  # "info", "warning", "critical"
 
 
+@dataclass
+class OrphanPosition:
+    """
+    A live position on an exchange that the bot is not tracking.
+
+    Always critical: an untracked position is unhedged by definition, carries
+    directional risk, and is invisible to every other safety mechanism -
+    emergency exit iterates tracked positions, so it would not be closed.
+    """
+    symbol: str
+    exchange: str
+    quantity: float
+    entry_price: float
+    side: str
+
+    def __repr__(self):
+        return (f"OrphanPosition({self.exchange} {self.side} {self.quantity} "
+                f"{self.symbol} @ {self.entry_price})")
+
+
 class LivePositionReconciler:
     """Reconciles tracked positions with live exchange state."""
 
@@ -38,6 +58,7 @@ class LivePositionReconciler:
         self.exchange_hub = exchange_hub
 
         self.mismatches: List[PositionMismatch] = []
+        self.orphans: List[OrphanPosition] = []
         self.last_sync_time: Dict[str, float] = {}
         self.sync_errors: List[str] = []
 
@@ -45,12 +66,21 @@ class LivePositionReconciler:
 
     async def reconcile_all(self, symbols: List[str]) -> ReconciliationStatus:
         """
-        Reconcile all tracked positions against live exchange state.
+        Reconcile in both directions.
 
-        Returns overall reconciliation status.
+        Forward  (tracked -> exchange): a position we believe we hold is missing
+                 or the wrong size.
+        Reverse  (exchange -> tracked): a position exists on the exchange that we
+                 are not tracking at all.
+
+        The reverse pass is what catches a leg that filled while its counterpart
+        failed, or anything opened outside the bot. Without it such a position is
+        invisible to every downstream safety mechanism, since they all iterate
+        tracked state.
         """
         logger.info(f"Starting reconciliation for {len(symbols)} symbols")
         self.mismatches = []
+        self.orphans = []
 
         status = ReconciliationStatus.SYNCED
 
@@ -61,10 +91,116 @@ class LivePositionReconciler:
             elif symbol_status == ReconciliationStatus.WARNING and status != ReconciliationStatus.CRITICAL:
                 status = ReconciliationStatus.WARNING
 
-        logger.info(f"Reconciliation complete: {status.value} "
-                   f"({len(self.mismatches)} mismatches found)")
+        # Reverse pass. Deliberately not scoped to `symbols`: a position on a
+        # symbol we were never configured for is exactly the kind of exposure
+        # that must not be missed.
+        if await self._detect_orphans():
+            status = ReconciliationStatus.CRITICAL
+
+        logger.info(
+            f"Reconciliation complete: {status.value} "
+            f"({len(self.mismatches)} mismatches, {len(self.orphans)} orphans)"
+        )
 
         return status
+
+    async def _detect_orphans(self) -> bool:
+        """
+        Find live positions the bot is not tracking.
+
+        Returns True if any orphan was found.
+        """
+        found = False
+
+        for exchange in ("Bybit", "Binance"):
+            live = await self._get_all_live_positions(exchange)
+            if live is None:
+                # A failed query is not evidence of absence. Say so rather than
+                # letting a silent fetch failure read as "no orphans".
+                logger.error(
+                    f"[{exchange}] Orphan scan INCOMPLETE - could not list positions"
+                )
+                continue
+
+            for entry in live:
+                symbol = entry["symbol"]
+                if self.position_manager.get_position(symbol, exchange) is not None:
+                    continue  # tracked; the forward pass owns this one
+
+                orphan = OrphanPosition(
+                    symbol=symbol,
+                    exchange=exchange,
+                    quantity=entry["quantity"],
+                    entry_price=entry["entry_price"],
+                    side=entry["side"],
+                )
+                self.orphans.append(orphan)
+                found = True
+                logger.critical(
+                    f"[{symbol}] ORPHAN POSITION on {exchange}: "
+                    f"{orphan.side} {orphan.quantity} @ {orphan.entry_price} "
+                    f"is live but untracked - unhedged exposure"
+                )
+
+        return found
+
+    async def _get_all_live_positions(self, exchange: str) -> Optional[List[Dict]]:
+        """
+        List every open position on an exchange, normalised.
+
+        Returns None when the query fails, which is distinct from an empty list.
+        Zero-size entries are dropped: Binance's positionRisk returns a row for
+        every symbol the account has ever touched, most with positionAmt "0".
+        """
+        try:
+            if exchange == "Bybit":
+                raw = await self.exchange_hub.bybit.get_positions()
+            else:
+                raw = await self.exchange_hub.binance.get_positions()
+        except Exception as e:
+            logger.error(f"[{exchange}] Failed to list positions: {e}")
+            self.sync_errors.append(f"{exchange}: {e}")
+            return None
+
+        if raw is None:
+            return None
+
+        normalised = []
+        for entry in raw:
+            try:
+                if exchange == "Bybit":
+                    quantity = float(entry.get("size") or 0)
+                    side = str(entry.get("side") or "").upper()
+                    entry_price = float(entry.get("avgPrice") or 0)
+                else:
+                    # Binance encodes direction in the sign of positionAmt.
+                    amount = float(entry.get("positionAmt") or 0)
+                    quantity = abs(amount)
+                    side = "BUY" if amount > 0 else "SELL"
+                    entry_price = float(entry.get("entryPrice") or 0)
+
+                if quantity == 0:
+                    continue
+
+                symbol = entry.get("symbol")
+                if not symbol:
+                    continue
+
+                normalised.append({
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "side": side,
+                    "entry_price": entry_price,
+                })
+            except (TypeError, ValueError) as e:
+                logger.error(f"[{exchange}] Unparseable position entry {entry}: {e}")
+                continue
+
+        return normalised
+
+    def get_orphans(self) -> List[OrphanPosition]:
+        """Live positions the bot is not tracking."""
+        return list(self.orphans)
 
     async def _reconcile_symbol(self, symbol: str) -> ReconciliationStatus:
         """Reconcile a single symbol across both exchanges."""
@@ -223,12 +359,20 @@ class LivePositionReconciler:
         critical = [m for m in self.mismatches if m.severity == "critical"]
         warnings = [m for m in self.mismatches if m.severity == "warning"]
 
+        # An orphan is always critical - it is unhedged exposure that no other
+        # safety mechanism can see.
+        if critical or self.orphans:
+            status = ReconciliationStatus.CRITICAL
+        elif warnings:
+            status = ReconciliationStatus.WARNING
+        else:
+            status = ReconciliationStatus.SYNCED
+
         return {
-            "status": ReconciliationStatus.CRITICAL if critical else (
-                ReconciliationStatus.WARNING if warnings else ReconciliationStatus.SYNCED
-            ),
+            "status": status,
             "critical_mismatches": len(critical),
             "warnings": len(warnings),
+            "orphans": len(self.orphans),
             "sync_errors": len(self.sync_errors),
             "last_sync": max(self.last_sync_time.values()) if self.last_sync_time else 0,
         }
@@ -243,7 +387,15 @@ class LivePositionReconciler:
         print(f"Status: {status['status'].value.upper()}")
         print(f"Critical Mismatches: {status['critical_mismatches']}")
         print(f"Warnings: {status['warnings']}")
+        print(f"Orphan Positions: {status['orphans']}")
         print(f"Sync Errors: {status['sync_errors']}")
+
+        if self.orphans:
+            print("\nORPHAN POSITIONS (live on exchange, untracked by the bot):")
+            for orphan in self.orphans:
+                print(f"  [CRITICAL] {orphan.symbol} on {orphan.exchange}: "
+                      f"{orphan.side} {orphan.quantity} @ ${orphan.entry_price:.2f}")
+            print("  -> unhedged exposure; emergency exit will NOT close these")
 
         if self.mismatches:
             print("\nDetailed Mismatches:")
