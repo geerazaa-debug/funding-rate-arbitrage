@@ -11,8 +11,10 @@ config/api_keys.json
 .env.*
 !.env.example
 
-# Ad-hoc scripts that touch live credentials. These get written quickly during
-# debugging and are exactly the files that leak keys into history.
+# Ad-hoc debugging scripts. These get written quickly, often with credentials
+# pasted inline, and are exactly the files that leak keys into history.
+# scripts/preflight.py is deliberately NOT here: it reads everything from .env
+# and is meant to be tracked and shared.
 check_live_api.py
 scratch_*.py
 _*.py
