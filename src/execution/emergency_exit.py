@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from src.utils.logger import setup_logger
 from src.execution.position_manager import PositionManager
 from src.execution.exchange_api_client import LiveExchangeHub
+from src.execution.order_executor import OrderSide
 
 logger = setup_logger("emergency_exit")
 
@@ -34,6 +35,7 @@ class ExitOrder:
     reason: Optional[EmergencyReason] = None
     timestamp: float = 0.0
     exit_price: Optional[float] = None
+    error: Optional[str] = None
 
 
 @dataclass
@@ -48,6 +50,12 @@ class EmergencyExitReport:
     total_loss: float = 0.0
     success: bool = False
     details: str = ""
+    # Legs present when the exit was triggered. Guards against an empty orders
+    # list being read as a vacuous success.
+    expected_legs: int = 0
+    # Set by wait_for_exits once fills are confirmed; distinct from `success`,
+    # which only reports whether every leg was accepted by the exchange.
+    all_filled: bool = False
 
     def __post_init__(self):
         if self.orders is None:
@@ -82,7 +90,7 @@ class EmergencyExitHandler:
             return None
 
         self.is_exiting = True
-        logger.critical(f"🚨 EMERGENCY EXIT TRIGGERED: {reason.value} - {details}")
+        logger.critical(f"EMERGENCY EXIT TRIGGERED: {reason.value} - {details}")
 
         report = EmergencyExitReport(
             reason=reason,
@@ -91,137 +99,217 @@ class EmergencyExitHandler:
         )
 
         try:
-            # Get all positions
-            all_positions = self.position_manager.get_all_positions()
-            if not all_positions:
+            # Snapshot the legs up front. Position state is mutated as legs are
+            # closed, so we must not iterate the live structure, and we need the
+            # expected count to tell "nothing to do" apart from "everything blew up".
+            legs = [
+                (symbol, exchange, position)
+                for symbol, exchanges in self.position_manager.get_all_positions().items()
+                for exchange, position in exchanges.items()
+            ]
+            report.expected_legs = len(legs)
+
+            if not legs:
                 logger.info("No positions to exit")
                 report.completed_at = time.time()
                 report.success = True
                 self.exit_reports.append(report)
                 return report
 
-            # Exit each symbol's positions
-            for symbol in all_positions:
-                await self._exit_symbol(symbol, reason, report)
+            logger.info(f"Exiting {len(legs)} position legs")
+
+            for symbol, exchange, position in legs:
+                exit_order = await self._exit_position(
+                    symbol, exchange, position.quantity, position.side, reason
+                )
+                report.orders.append(exit_order)
 
             report.completed_at = time.time()
-            report.success = all(o.status == "filled" for o in report.orders)
+            report.success = self._evaluate_success(report)
 
-            logger.info(f"Emergency exit completed: {report.success}")
+            if report.success:
+                logger.info(f"Emergency exit: all {report.expected_legs} legs submitted")
+            else:
+                failed = [o for o in report.orders if o.status == "failed"]
+                logger.critical(
+                    f"EMERGENCY EXIT INCOMPLETE: {len(failed)}/{report.expected_legs} "
+                    f"legs failed to submit - MANUAL INTERVENTION REQUIRED"
+                )
             self.exit_reports.append(report)
 
             return report
 
         except Exception as e:
-            logger.error(f"Emergency exit error: {e}")
-            report.details = f"Error: {e}"
+            logger.critical(f"Emergency exit error: {e}", exc_info=True)
+            report.details = f"{report.details} | Error: {e}".strip(" |")
             report.completed_at = time.time()
+            report.success = False
             self.exit_reports.append(report)
             return report
 
         finally:
             self.is_exiting = False
 
-    async def _exit_symbol(self, symbol: str, reason: EmergencyReason, report: EmergencyExitReport):
-        """Exit all positions for a single symbol."""
-        positions = self.position_manager.get_symbol_positions(symbol)
+    @staticmethod
+    def _evaluate_success(report: "EmergencyExitReport") -> bool:
+        """
+        An exit succeeds only when every expected leg produced a submitted order.
 
-        logger.info(f"Exiting {len(positions)} positions for {symbol}")
+        Deliberately does NOT require fills: fills resolve asynchronously via
+        wait_for_exits, so requiring them here would report failure on the happy
+        path. An empty order list against a non-zero expected_legs is a failure,
+        never a vacuous success.
+        """
+        if report.expected_legs == 0:
+            return True
+        if len(report.orders) != report.expected_legs:
+            return False
+        return all(o.status != "failed" for o in report.orders)
 
-        for exchange, position in positions.items():
-            exit_order = await self._exit_position(
-                symbol, exchange, position.quantity, position.side, reason
-            )
-            if exit_order:
-                report.orders.append(exit_order)
+    @staticmethod
+    def _exit_side_for(side) -> OrderSide:
+        """
+        Map an open position's side to the side that CLOSES it.
+
+        LONG -> SELL (OrderSide.SHORT), SHORT -> BUY (OrderSide.LONG).
+        Accepts the OrderSide enum or its string name so a caller passing "LONG"
+        cannot silently fall through to the wrong branch.
+        """
+        if isinstance(side, OrderSide):
+            return OrderSide.SHORT if side is OrderSide.LONG else OrderSide.LONG
+        normalized = str(side).strip().upper()
+        if normalized in ("LONG", "BUY", "ORDERSIDE.LONG"):
+            return OrderSide.SHORT
+        if normalized in ("SHORT", "SELL", "ORDERSIDE.SHORT"):
+            return OrderSide.LONG
+        raise ValueError(f"Unrecognised position side: {side!r}")
 
     async def _exit_position(self, symbol: str, exchange: str, quantity: float,
-                            side: str, reason: EmergencyReason) -> Optional[ExitOrder]:
-        """Exit a single position."""
+                            side, reason: EmergencyReason) -> ExitOrder:
+        """
+        Exit a single position leg.
+
+        Always returns an ExitOrder - never None and never swallows an exception
+        into a missing record, because a dropped leg would make the exit look
+        complete when a position is still open.
+        """
         try:
-            # Determine exit side (opposite of entry)
-            if side == "LONG":
-                exit_side = "SELL"
-            else:
-                exit_side = "BUY"
+            exit_side = self._exit_side_for(side)
+        except ValueError as e:
+            logger.critical(f"[{symbol}] Cannot determine exit side on {exchange}: {e}")
+            return ExitOrder(
+                symbol=symbol, exchange=exchange, side="UNKNOWN", quantity=quantity,
+                status="failed", reason=reason, timestamp=time.time(),
+                error=str(e),
+            )
 
-            logger.info(f"[{symbol}] Emergency exit on {exchange}: {exit_side} {quantity}")
+        logger.info(f"[{symbol}] Emergency exit on {exchange}: "
+                    f"{exit_side.value} {quantity} (position was {side})")
 
-            # Place market order
+        try:
+            # reduce_only guarantees the order can only shrink an existing position.
+            # Without it a stale quantity would open fresh exposure the wrong way.
             if exchange == "Bybit":
                 order = await self.exchange_hub.bybit.place_order(
-                    symbol, exit_side, quantity, order_type="Market"
+                    symbol, exit_side.value, quantity,
+                    order_type="Market", reduce_only=True
                 )
-            else:  # Binance
-                order = await self.exchange_hub.binance.place_order(
-                    symbol, exit_side, quantity, order_type="MARKET"
-                )
-
-            if order:
-                exit_order = ExitOrder(
-                    symbol=symbol,
-                    exchange=exchange,
-                    side=exit_side,
-                    quantity=quantity,
-                    order_id=order.get("orderId"),
-                    status="submitted",
-                    reason=reason,
-                    timestamp=time.time(),
-                )
-                logger.info(f"[{symbol}] Exit order submitted: {exit_order.order_id}")
-                return exit_order
             else:
-                logger.error(f"[{symbol}] Failed to place exit order on {exchange}")
-                exit_order = ExitOrder(
-                    symbol=symbol,
-                    exchange=exchange,
-                    side=exit_side,
-                    quantity=quantity,
-                    status="failed",
-                    reason=reason,
-                    timestamp=time.time(),
+                order = await self.exchange_hub.binance.place_order(
+                    symbol, exit_side.value, quantity,
+                    order_type="MARKET", reduce_only=True
                 )
-                return exit_order
-
         except Exception as e:
-            logger.error(f"[{symbol}] Exit error on {exchange}: {e}")
-            return None
+            logger.critical(f"[{symbol}] Exit order raised on {exchange}: {e}", exc_info=True)
+            return ExitOrder(
+                symbol=symbol, exchange=exchange, side=exit_side.value, quantity=quantity,
+                status="failed", reason=reason, timestamp=time.time(),
+                error=repr(e),
+            )
+
+        if not order:
+            logger.critical(f"[{symbol}] Exit order REJECTED on {exchange} - position still open")
+            return ExitOrder(
+                symbol=symbol, exchange=exchange, side=exit_side.value, quantity=quantity,
+                status="failed", reason=reason, timestamp=time.time(),
+                error="exchange returned no order",
+            )
+
+        exit_order = ExitOrder(
+            symbol=symbol, exchange=exchange, side=exit_side.value, quantity=quantity,
+            order_id=str(order.get("orderId")) if order.get("orderId") is not None else None,
+            status="submitted", reason=reason, timestamp=time.time(),
+        )
+        logger.info(f"[{symbol}] Exit order submitted on {exchange}: {exit_order.order_id}")
+
+        # Drop the leg from tracked state only once the exchange has accepted the
+        # close. A failed leg stays tracked so a retry still sees it; a submitted
+        # leg is released so a re-trigger cannot fire a duplicate market order.
+        self._release_tracked_position(symbol, exchange)
+
+        return exit_order
+
+    def _release_tracked_position(self, symbol: str, exchange: str):
+        """Remove a closed leg from PositionManager, recording the Trade."""
+        try:
+            position = self.position_manager.get_position(symbol, exchange)
+            if position is None:
+                return
+            exit_price = position.current_price or position.entry_price
+            self.position_manager.close_position(symbol, exchange, exit_price)
+        except Exception as e:
+            # Never let bookkeeping failure abort an in-flight emergency exit.
+            logger.error(f"[{symbol}] Failed to release tracked position on {exchange}: {e}")
 
     async def wait_for_exits(self, timeout_s: float = 30) -> bool:
         """
-        Wait for all pending exit orders to complete.
+        Poll submitted exit orders until they fill or the timeout expires.
 
-        Args:
-            timeout_s: Max time to wait
-
-        Returns:
-            True if all filled, False if timeout
+        Returns True when every submitted order is filled. Legs that failed to
+        submit are never waited on - they can never fill - and are reported by
+        trigger_exit instead.
         """
         start = time.time()
 
-        while time.time() - start < timeout_s:
-            if not self.exit_reports:
+        if not self.exit_reports:
+            return False
+
+        report = self.exit_reports[-1]
+
+        while True:
+            waitable = [
+                o for o in report.orders
+                if o.status == "submitted" and o.order_id is not None
+            ]
+            if not waitable:
+                # Either everything filled, or nothing was ever submittable.
+                filled = [o for o in report.orders if o.status == "filled"]
+                report.all_filled = bool(filled) and len(filled) == report.expected_legs
+                return report.all_filled
+
+            if time.time() - start >= timeout_s:
+                logger.critical(
+                    f"Exit wait timeout after {timeout_s}s with "
+                    f"{len(waitable)} leg(s) unconfirmed - VERIFY POSITIONS MANUALLY"
+                )
                 return False
 
-            latest_report = self.exit_reports[-1]
-            if not latest_report.orders:
-                return True
-
-            pending = [o for o in latest_report.orders if o.status != "filled"]
-            if not pending:
-                return True
-
-            # Check status
-            for order in pending:
+            for order in waitable:
                 await self._check_exit_order_status(order)
 
             await asyncio.sleep(1)
 
-        logger.warning(f"Exit wait timeout after {timeout_s}s")
-        return False
-
     async def _check_exit_order_status(self, order: ExitOrder):
-        """Check status of an exit order."""
+        """
+        Refresh one exit order's status from the exchange.
+
+        Bybit reports the field as 'orderStatus'; Binance as 'status'. Both are
+        checked because a missing field previously left every order stuck in
+        'submitted' until the timeout expired.
+        """
+        if order.order_id is None:
+            return
+
         try:
             if order.exchange == "Bybit":
                 status = await self.exchange_hub.bybit.get_order_status(
@@ -231,16 +319,30 @@ class EmergencyExitHandler:
                 status = await self.exchange_hub.binance.get_order_status(
                     order.symbol, order.order_id
                 )
-
-            if status:
-                if status.get("status") == "Filled" or status.get("status") == "FILLED":
-                    order.status = "filled"
-                    order.exit_price = float(status.get("avgPrice", 0))
-                elif status.get("status") == "Cancelled" or status.get("status") == "CANCELED":
-                    order.status = "failed"
-
         except Exception as e:
-            logger.error(f"Failed to check order status: {e}")
+            logger.error(f"[{order.symbol}] Failed to check order status: {e}")
+            return
+
+        if not status:
+            return
+
+        raw = status.get("orderStatus") or status.get("status") or ""
+        state = str(raw).strip().upper()
+
+        if state == "FILLED":
+            order.status = "filled"
+            price = status.get("avgPrice") or status.get("averagePrice") or 0
+            try:
+                order.exit_price = float(price)
+            except (TypeError, ValueError):
+                order.exit_price = None
+        elif state in ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED"):
+            order.status = "failed"
+            order.error = f"exchange reported {state}"
+            logger.critical(
+                f"[{order.symbol}] Exit order {order.order_id} {state} on "
+                f"{order.exchange} - position may still be open"
+            )
 
     def get_exit_history(self, limit: int = 10) -> List[EmergencyExitReport]:
         """Get recent exit reports."""
@@ -268,7 +370,7 @@ class EmergencyExitHandler:
 
         print(f"\nOrders ({len(report.orders)}):")
         for order in report.orders:
-            status_icon = "✓" if order.status == "filled" else "✗" if order.status == "failed" else "⏳"
+            status_icon = "[OK]" if order.status == "filled" else "[FAIL]" if order.status == "failed" else "[PENDING]"
             print(f"  {status_icon} {order.symbol} on {order.exchange}: "
                   f"{order.side} {order.quantity} @ ${order.exit_price or 'N/A'}")
 

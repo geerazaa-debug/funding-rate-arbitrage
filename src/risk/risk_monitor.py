@@ -85,7 +85,7 @@ class RiskMonitor:
             checks.append(RiskCheck(
                 name="DeltaNeutrality",
                 passed=True,
-                details=f"Delta OK: {current_delta:.4f} → {current_delta + quantity:.4f}",
+                details=f"Delta OK: {current_delta:.4f} -> {current_delta + quantity:.4f}",
             ))
 
         # 4. Capital sufficiency
@@ -128,7 +128,7 @@ class RiskMonitor:
                    f"Capital=${self.current_capital:.2f}, Duration={duration_s:.0f}s")
 
         if not allowed:
-            logger.error(f"[{symbol}] ⚠️ Circuit breaker triggered!")
+            logger.error(f"[{symbol}] Circuit breaker triggered!")
 
         return allowed
 

@@ -184,11 +184,15 @@ class TestLivePositionReconciler:
             # Add a tracked position
             position_manager.add_position("Bybit", "BTCUSDT", "LONG", 1.0, 45000.0)
 
-            # Reconcile
+            # Reconcile. tracked=1.0 vs actual=0.5 is a 50% divergence, which is
+            # well past the 10% critical threshold - a half-missing hedge leg is
+            # not a warning.
             status = await reconciler._reconcile_symbol("BTCUSDT")
 
-            assert status == ReconciliationStatus.WARNING
+            assert status == ReconciliationStatus.CRITICAL
             assert len(reconciler.mismatches) > 0
+            assert reconciler.mismatches[0].severity == "critical"
+            assert reconciler.mismatches[0].difference_pct == pytest.approx(50.0)
 
 
 class TestSlippageTracker:

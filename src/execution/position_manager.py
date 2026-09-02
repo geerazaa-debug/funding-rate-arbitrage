@@ -63,7 +63,7 @@ class Trade:
 
     def __repr__(self):
         pnl_str = f"${self.realized_pnl:.2f}" if self.realized_pnl else "N/A"
-        return f"Trade({self.symbol} {self.quantity} {self.entry_price:.2f}→{self.exit_price}, PnL={pnl_str})"
+        return f"Trade({self.symbol} {self.quantity} {self.entry_price:.2f}->{self.exit_price}, PnL={pnl_str})"
 
 
 class PositionManager:
@@ -81,13 +81,32 @@ class PositionManager:
 
         logger.info("Initialized position manager")
 
+    @staticmethod
+    def _coerce_side(side) -> OrderSide:
+        """
+        Normalise a side to OrderSide.
+
+        Callers have historically passed both the enum and bare strings ("LONG").
+        Storing whichever arrived made `position.side == OrderSide.LONG` silently
+        false for string callers, which inverted close-side decisions downstream.
+        Normalising at the boundary makes that class of bug impossible.
+        """
+        if isinstance(side, OrderSide):
+            return side
+        normalized = str(side).strip().upper()
+        if normalized in ("LONG", "BUY", "ORDERSIDE.LONG"):
+            return OrderSide.LONG
+        if normalized in ("SHORT", "SELL", "ORDERSIDE.SHORT"):
+            return OrderSide.SHORT
+        raise ValueError(f"Unrecognised position side: {side!r}")
+
     def add_position(self, exchange: str, symbol: str, side: OrderSide,
                     quantity: float, entry_price: float) -> Position:
         """Create and track a new position."""
         position = Position(
             exchange=exchange,
             symbol=symbol,
-            side=side,
+            side=self._coerce_side(side),
             quantity=quantity,
             entry_price=entry_price,
             entry_time=time.time(),

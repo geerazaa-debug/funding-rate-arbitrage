@@ -72,6 +72,7 @@ class TestWebhookAlerter:
     @pytest.mark.asyncio
     async def test_alert_trade_opened(self, alerter):
         """Test trade opened alert."""
+        alerter.register_webhook("slack", "https://hooks.slack.com/test")
         with patch.object(alerter, "_send_to_service", new_callable=AsyncMock):
             await alerter.alert_trade_opened("BTCUSDT", "Bybit/Binance", 1.0, 0.0001)
 
@@ -81,6 +82,7 @@ class TestWebhookAlerter:
     @pytest.mark.asyncio
     async def test_alert_emergency_exit(self, alerter):
         """Test emergency exit alert."""
+        alerter.register_webhook("slack", "https://hooks.slack.com/test")
         with patch.object(alerter, "_send_to_service", new_callable=AsyncMock):
             await alerter.alert_emergency_exit("Circuit breaker halted")
 
@@ -88,6 +90,51 @@ class TestWebhookAlerter:
             latest = alerter.sent_alerts[-1]
             assert latest.type == AlertType.EMERGENCY_EXIT
             assert latest.level == AlertLevel.CRITICAL
+
+    @pytest.mark.asyncio
+    async def test_alert_with_no_webhooks_is_recorded_not_lost(self, alerter):
+        """An undeliverable alert must never vanish silently."""
+        await alerter.alert_emergency_exit("Circuit breaker halted")
+
+        assert alerter.sent_alerts == []
+        assert len(alerter.failed_alerts) == 1, \
+            "an alert with nowhere to go must still be recorded"
+
+    @pytest.mark.asyncio
+    async def test_alert_error_exists_and_sends(self, alerter):
+        """WEEK4_USAGE.md calls this from an except block; it must exist."""
+        alerter.register_webhook("slack", "https://hooks.slack.com/test")
+        with patch.object(alerter, "_send_to_service", new_callable=AsyncMock):
+            await alerter.alert_error("boom", context="main loop")
+
+            assert alerter.sent_alerts[-1].type == AlertType.ERROR
+
+    @pytest.mark.asyncio
+    async def test_alert_error_never_raises(self, alerter):
+        """Raising here would mask the original error and skip recovery."""
+        alerter.register_webhook("slack", "https://hooks.slack.com/test")
+        with patch.object(alerter, "_send_to_service",
+                          new_callable=AsyncMock, side_effect=RuntimeError("network")):
+            await alerter.alert_error("boom")  # must not propagate
+
+    def test_telegram_requires_chat_id(self, alerter):
+        """Registering without chat_id used to yield HTTP 400 on every send."""
+        with pytest.raises(ValueError):
+            alerter.register_webhook("telegram", "https://api.telegram.org/botX/sendMessage")
+
+    def test_telegram_payload_includes_chat_id(self, alerter):
+        alerter.register_webhook(
+            "telegram", "https://api.telegram.org/botX/sendMessage", chat_id="12345"
+        )
+        alert = Alert(
+            type=AlertType.ERROR, level=AlertLevel.CRITICAL,
+            title="T", message="m",
+        )
+        payload = alerter._format_telegram(alert, chat_id="12345")
+
+        assert payload["chat_id"] == "12345"
+        assert "**" not in payload["text"], \
+            "legacy Markdown renders ** literally; bold uses single asterisks"
 
     def test_format_slack(self, alerter):
         """Test Slack message formatting."""

@@ -50,15 +50,28 @@ class WebhookAlerter:
 
     def __init__(self):
         self.webhooks: Dict[str, str] = {}
+        # Per-service extras, e.g. Telegram's chat_id, which is mandatory and was
+        # previously absent - making every Telegram alert fail with HTTP 400.
+        self.webhook_options: Dict[str, Dict] = {}
         self.sent_alerts: List[Alert] = []
         self.failed_alerts: List[Alert] = []
         self.session: Optional[aiohttp.ClientSession] = None
 
         logger.info("Initialized webhook alerter")
 
-    def register_webhook(self, service: str, url: str):
-        """Register a webhook URL."""
+    def register_webhook(self, service: str, url: str, **options):
+        """
+        Register a webhook URL.
+
+        Telegram requires chat_id: register_webhook("telegram", url, chat_id="...").
+        """
+        if service.lower() == "telegram" and not options.get("chat_id"):
+            raise ValueError(
+                "Telegram webhooks require chat_id: "
+                'register_webhook("telegram", url, chat_id="...")'
+            )
         self.webhooks[service] = url
+        self.webhook_options[service] = options
         logger.info(f"Registered webhook for {service}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -81,6 +94,17 @@ class WebhookAlerter:
         if services is None:
             services = list(self.webhooks.keys())
 
+        # An alert with nowhere to go previously vanished: it landed in neither
+        # sent_alerts nor failed_alerts and logged nothing, so a misconfigured
+        # bot looked like it had working alerting while emitting none.
+        if not services:
+            logger.error(
+                f"ALERT NOT DELIVERED (no webhooks registered): "
+                f"[{alert.level.value}] {alert.title} - {alert.message}"
+            )
+            self.failed_alerts.append(alert)
+            return False
+
         success = False
 
         for service in services:
@@ -98,6 +122,13 @@ class WebhookAlerter:
         if success:
             self.sent_alerts.append(alert)
             logger.debug(f"Alert sent: {alert.title}")
+        else:
+            # Every configured channel rejected it; make sure the content still
+            # reaches the log rather than being lost with the HTTP error.
+            logger.error(
+                f"ALERT NOT DELIVERED (all channels failed): "
+                f"[{alert.level.value}] {alert.title} - {alert.message}"
+            )
 
         return success
 
@@ -105,10 +136,12 @@ class WebhookAlerter:
         """Send alert to a specific service."""
         url = self.webhooks[service]
 
+        options = self.webhook_options.get(service, {})
+
         if service.lower() == "slack":
             payload = self._format_slack(alert)
         elif service.lower() == "telegram":
-            payload = self._format_telegram(alert)
+            payload = self._format_telegram(alert, options.get("chat_id"))
         elif service.lower() == "discord":
             payload = self._format_discord(alert)
         else:
@@ -146,23 +179,31 @@ class WebhookAlerter:
             ]
         }
 
-    def _format_telegram(self, alert: Alert) -> Dict:
-        """Format alert for Telegram."""
+    def _format_telegram(self, alert: Alert, chat_id: Optional[str] = None) -> Dict:
+        """
+        Format alert for Telegram's sendMessage.
+
+        chat_id is mandatory - omitting it returns HTTP 400. Legacy "Markdown"
+        parse mode uses *single asterisks* for bold; **double** renders literally.
+        """
         level_emoji = {
             AlertLevel.INFO: "ℹ️",
             AlertLevel.WARNING: "⚠️",
-            AlertLevel.CRITICAL: "🚨",
+            AlertLevel.CRITICAL: "\U0001f6a8",
         }
 
-        text = f"{level_emoji.get(alert.level, '📌')} **{alert.title}**\n"
+        text = f"{level_emoji.get(alert.level, '\U0001f4cc')} *{alert.title}*\n"
         text += f"{alert.message}\n\n"
         text += f"_Type: {alert.type.value}_\n"
         text += f"_Time: {time.strftime('%H:%M:%S', time.localtime(alert.timestamp))}_"
 
-        return {
+        payload = {
             "text": text,
             "parse_mode": "Markdown",
         }
+        if chat_id:
+            payload["chat_id"] = chat_id
+        return payload
 
     def _format_discord(self, alert: Alert) -> Dict:
         """Format alert for Discord."""
@@ -230,7 +271,7 @@ class WebhookAlerter:
         alert = Alert(
             type=AlertType.EMERGENCY_EXIT,
             level=AlertLevel.CRITICAL,
-            title="🚨 EMERGENCY EXIT TRIGGERED",
+            title="EMERGENCY EXIT TRIGGERED",
             message=f"Reason: {reason}",
             data={"reason": reason},
         )
@@ -241,7 +282,7 @@ class WebhookAlerter:
         alert = Alert(
             type=AlertType.CIRCUIT_BREAKER,
             level=AlertLevel.CRITICAL,
-            title="⚠️ Circuit Breaker Halted",
+            title="Circuit Breaker Halted",
             message=f"Reason: {reason}",
             data={"reason": reason},
         )
@@ -256,6 +297,63 @@ class WebhookAlerter:
             title=f"Position Mismatch: {symbol} on {exchange}",
             message=f"Tracked: {tracked_qty}\nActual: {actual_qty}",
             data={"symbol": symbol, "exchange": exchange, "tracked": tracked_qty, "actual": actual_qty},
+        )
+        await self.send_alert(alert, services)
+
+    async def alert_error(self, message: str, context: Optional[str] = None,
+                         services: Optional[List[str]] = None):
+        """
+        Alert on an unexpected bot error.
+
+        Called from exception handlers, so it must never raise: an alerting
+        failure inside an `except` block would mask the original error and skip
+        whatever recovery follows it.
+        """
+        try:
+            alert = Alert(
+                type=AlertType.ERROR,
+                level=AlertLevel.CRITICAL,
+                title="Bot Error",
+                message=f"{message}\nContext: {context}" if context else message,
+                data={"error": message, "context": context},
+            )
+            await self.send_alert(alert, services)
+        except Exception as e:
+            logger.error(f"alert_error failed while reporting '{message}': {e}")
+
+    async def alert_high_slippage(self, symbol: str, exchange: str, slippage_bps: float,
+                                 services: Optional[List[str]] = None):
+        """Alert on an unusually costly fill."""
+        alert = Alert(
+            type=AlertType.HIGH_SLIPPAGE,
+            level=AlertLevel.WARNING,
+            title=f"High Slippage: {symbol}",
+            message=f"{exchange} filled {slippage_bps:.1f} bps away from expected",
+            data={"symbol": symbol, "exchange": exchange, "slippage_bps": slippage_bps},
+        )
+        await self.send_alert(alert, services)
+
+    async def alert_funding_update(self, symbol: str, amount: float,
+                                  services: Optional[List[str]] = None):
+        """Alert when a funding payment is received."""
+        alert = Alert(
+            type=AlertType.FUNDING_UPDATE,
+            level=AlertLevel.INFO,
+            title=f"Funding Received: {symbol}",
+            message=f"Amount: ${amount:.2f}",
+            data={"symbol": symbol, "amount": amount},
+        )
+        await self.send_alert(alert, services)
+
+    async def alert_connection_lost(self, exchange: str,
+                                   services: Optional[List[str]] = None):
+        """Alert when an exchange connection drops."""
+        alert = Alert(
+            type=AlertType.CONNECTION_LOST,
+            level=AlertLevel.CRITICAL,
+            title=f"Connection Lost: {exchange}",
+            message=f"Lost connection to {exchange}",
+            data={"exchange": exchange},
         )
         await self.send_alert(alert, services)
 

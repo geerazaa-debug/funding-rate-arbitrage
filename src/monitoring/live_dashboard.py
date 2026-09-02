@@ -85,18 +85,18 @@ class LiveDashboard:
         print("=" * 100)
 
         # Positions section
-        print(f"\n📊 POSITIONS ({data['positions']['open']} open)")
+        print(f"\nPOSITIONS ({data['positions']['open']} open)")
         print(f"   Total Exposure: ${data['positions']['total_exposure']:,.2f}")
 
         # P&L section
-        print(f"\n💰 P&L")
+        print(f"\nP&L")
         unrealized = data['pnl']['unrealized']
         realized = data['pnl']['realized']
         total = data['pnl']['total']
 
-        unrealized_color = "↑" if unrealized > 0 else "↓"
-        realized_color = "↑" if realized > 0 else "↓"
-        total_color = "↑" if total > 0 else "↓"
+        unrealized_color = "+" if unrealized > 0 else "-"
+        realized_color = "+" if realized > 0 else "-"
+        total_color = "+" if total > 0 else "-"
 
         print(f"   Unrealized: {unrealized_color} ${unrealized:,.2f}")
         print(f"   Realized:   {realized_color} ${realized:,.2f}")
@@ -104,24 +104,24 @@ class LiveDashboard:
 
         # Trades section
         trades = data['trades']
-        print(f"\n📈 TRADES ({trades['total']} total)")
+        print(f"\nTRADES ({trades['total']} total)")
         print(f"   W/L: {trades['winning']}/{trades['losing']}")
         print(f"   Win Rate: {trades['win_rate']*100:.1f}%")
         print(f"   Avg P&L: ${trades['avg_pnl']:.2f}")
 
         # Funding section
-        print(f"\n💵 FUNDING EARNED")
+        print(f"\nFUNDING EARNED")
         print(f"   Total: ${data['funding']['total_earned']:.2f}")
 
         # Slippage section
         slippage = data['slippage']
-        print(f"\n📉 SLIPPAGE")
+        print(f"\nSLIPPAGE")
         print(f"   Avg: {slippage['avg_bps']:.2f} bps")
         print(f"   Total Cost: ${slippage['total_usd']:.2f}")
 
         # Risk section
         risk = data['risk']
-        print(f"\n⚠️  RISK MANAGEMENT")
+        print(f"\n RISK MANAGEMENT")
         print(f"   Circuit Breaker: {risk['circuit_breaker_status'].upper()}")
         print(f"   Daily Loss: ${risk['daily_loss']:.2f}")
         print(f"   Drawdown: {risk['drawdown_pct']:.2f}%")
@@ -137,7 +137,7 @@ class LiveDashboard:
         # Position details
         all_positions = self.position_manager.get_all_positions()
         if all_positions:
-            print("\n📍 OPEN POSITIONS")
+            print("\nOPEN POSITIONS")
             for symbol, exchanges in all_positions.items():
                 print(f"\n  {symbol}:")
                 for exchange, position in exchanges.items():
@@ -148,7 +148,7 @@ class LiveDashboard:
         # Trade details
         recent_trades = self.position_manager.trades[-10:]
         if recent_trades:
-            print("\n📋 RECENT TRADES (last 10)")
+            print("\nRECENT TRADES (last 10)")
             for trade in recent_trades:
                 pnl = f"${trade.realized_pnl:.2f}" if trade.realized_pnl else "N/A"
                 duration = f"{trade.duration_seconds}s" if trade.duration_seconds else "N/A"
@@ -157,14 +157,14 @@ class LiveDashboard:
         # Funding details
         recent_funding = self.funding_accumulator.funding_records[-10:]
         if recent_funding:
-            print("\n💵 RECENT FUNDING PAYMENTS (last 10)")
+            print("\nRECENT FUNDING PAYMENTS (last 10)")
             for record in recent_funding:
                 print(f"  {record.symbol} on {record.exchange}: ${record.amount:.2f} @ {record.funding_rate:.6f}")
 
         # Slippage details
         worst_slippage = self.slippage_tracker.get_worst_slippage(5)
         if worst_slippage:
-            print("\n📉 WORST SLIPPAGE EVENTS (top 5)")
+            print("\nWORST SLIPPAGE EVENTS (top 5)")
             for record in worst_slippage:
                 print(f"  {record.symbol} on {record.exchange}: {record.slippage_bps:.1f} bps (${record.slippage_usd:.2f})")
 
@@ -188,6 +188,8 @@ class LiveDashboard:
                 "Quantity", "Realized P&L", "Funding Earned", "Total P&L", "Duration (s)"
             ])
             for trade in trades:
+                realized = trade.realized_pnl or 0.0
+                funding = trade.funding_earned or 0.0
                 writer.writerow([
                     trade.symbol,
                     trade.entry_time,
@@ -195,9 +197,11 @@ class LiveDashboard:
                     trade.entry_price,
                     trade.exit_price,
                     trade.quantity,
-                    trade.realized_pnl,
-                    trade.funding_earned,
-                    trade.realized_pnl,
+                    realized,
+                    funding,
+                    # Previously wrote realized_pnl a second time, so the exported
+                    # total silently omitted funding and disagreed with the dashboard.
+                    realized + funding,
                     trade.duration_seconds,
                 ])
 

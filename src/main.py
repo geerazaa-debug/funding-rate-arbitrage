@@ -110,7 +110,7 @@ class FundingRateBot:
                 print(f"\n{pair}:")
                 print(f"  Bybit:   {bybit:>12} (age: {bybit_age:>6})")
                 print(f"  Binance: {binance:>12} (age: {binance_age:>6})")
-                print(f"  Δ (B-Y): {delta:>12}")
+                print(f"Delta (B-Y): {delta:>12}")
 
                 # Print stats
                 bybit_stats = self.tracker.get_stats(pair, "bybit")
@@ -127,7 +127,7 @@ class FundingRateBot:
         if self.tracker.alerts_triggered:
             print("\n--- Recent Alerts ---")
             for alert in self.tracker.alerts_triggered[-5:]:  # Last 5 alerts
-                print(f"  ⚠ {alert}")
+                print(f"{alert}")
 
         print("=" * 100 + "\n")
 

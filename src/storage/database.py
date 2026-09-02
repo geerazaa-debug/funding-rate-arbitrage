@@ -63,7 +63,13 @@ class Database:
             )
         """)
 
-        # Positions table
+        # Positions table.
+        #
+        # UNIQUE(symbol, exchange) makes this a live snapshot of open positions
+        # rather than an append-only log. Without it, repeated snapshots and
+        # re-opened positions accumulated duplicate rows and closed positions were
+        # never removed, so get_open_positions() reported phantom exposure -
+        # dangerous for anything reconciling state after a restart.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +83,8 @@ class Database:
                 unrealized_pnl REAL,
                 entry_differential REAL,
                 last_update TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(symbol, exchange)
             )
         """)
 
@@ -166,20 +173,44 @@ class Database:
         return cursor.lastrowid
 
     def insert_position(self, position: PositionRecord) -> int:
-        """Insert an open position record."""
+        """
+        Upsert an open position.
+
+        INSERT OR REPLACE keyed on the table's UNIQUE(symbol, exchange): re-writing
+        the same leg updates it in place instead of appending a duplicate row.
+        """
         cursor = self.connection.cursor()
         data = position.to_dict()
         data.pop('id', None)
 
         cols = ", ".join(data.keys())
         placeholders = ", ".join(["?" for _ in data])
-        query = f"INSERT INTO positions ({cols}) VALUES ({placeholders})"
+        query = f"INSERT OR REPLACE INTO positions ({cols}) VALUES ({placeholders})"
 
         cursor.execute(query, tuple(data.values()))
         self.connection.commit()
 
-        logger.debug(f"Position inserted: {position.symbol} on {position.exchange}")
+        logger.debug(f"Position upserted: {position.symbol} on {position.exchange}")
         return cursor.lastrowid
+
+    def delete_position(self, symbol: str, exchange: str) -> bool:
+        """
+        Remove a position once it is closed.
+
+        Must be called on close, otherwise the row lingers and is reported as
+        open exposure that no longer exists.
+        """
+        cursor = self.connection.cursor()
+        cursor.execute(
+            "DELETE FROM positions WHERE symbol = ? AND exchange = ?",
+            (symbol, exchange),
+        )
+        self.connection.commit()
+
+        if cursor.rowcount:
+            logger.debug(f"Position removed: {symbol} on {exchange}")
+            return True
+        return False
 
     def insert_funding(self, funding: FundingRecord) -> int:
         """Insert a funding payment record."""
@@ -288,20 +319,21 @@ class Database:
         """Get slippage statistics."""
         cursor = self.connection.cursor()
 
+        aggregates = (
+            "COALESCE(AVG(slippage_bps), 0.0) as avg_bps, "
+            "COALESCE(MAX(slippage_bps), 0.0) as max_bps, "
+            "COALESCE(SUM(slippage_usd), 0.0) as total_usd, "
+            "COUNT(*) as count"
+        )
+
         if exchange:
             cursor.execute(
-                "SELECT AVG(slippage_bps) as avg_bps, MAX(slippage_bps) as max_bps, "
-                "SUM(slippage_usd) as total_usd, COUNT(*) as count FROM slippage WHERE exchange = ?",
-                (exchange,)
+                f"SELECT {aggregates} FROM slippage WHERE exchange = ?", (exchange,)
             )
         else:
-            cursor.execute(
-                "SELECT AVG(slippage_bps) as avg_bps, MAX(slippage_bps) as max_bps, "
-                "SUM(slippage_usd) as total_usd, COUNT(*) as count FROM slippage"
-            )
+            cursor.execute(f"SELECT {aggregates} FROM slippage")
 
-        result = cursor.fetchone()
-        return dict(result) if result else {}
+        return dict(cursor.fetchone() or {})
 
     def get_metrics_history(self, hours: int = 24, interval_minutes: int = 60) -> List[Dict]:
         """Get metrics history."""
@@ -320,22 +352,27 @@ class Database:
         """Get overall trade statistics."""
         cursor = self.connection.cursor()
 
+        # COALESCE throughout: on an empty table SUM/AVG/MAX/MIN return NULL,
+        # which reached callers as None and raised TypeError the moment anyone
+        # formatted it (f"${stats['total_pnl']:.2f}").
         cursor.execute("""
             SELECT
                 COUNT(*) as total_trades,
-                SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
-                SUM(CASE WHEN realized_pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
-                SUM(total_pnl) as total_pnl,
-                AVG(total_pnl) as avg_pnl,
-                MAX(total_pnl) as max_pnl,
-                MIN(total_pnl) as min_pnl,
-                AVG(duration_seconds) as avg_duration_s
+                COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0) as winning_trades,
+                COALESCE(SUM(CASE WHEN realized_pnl <= 0 THEN 1 ELSE 0 END), 0) as losing_trades,
+                COALESCE(SUM(total_pnl), 0.0) as total_pnl,
+                COALESCE(AVG(total_pnl), 0.0) as avg_pnl,
+                COALESCE(MAX(total_pnl), 0.0) as max_pnl,
+                COALESCE(MIN(total_pnl), 0.0) as min_pnl,
+                COALESCE(AVG(duration_seconds), 0.0) as avg_duration_s
             FROM trades
             WHERE exit_time IS NOT NULL
         """)
 
-        result = cursor.fetchone()
-        return dict(result) if result else {}
+        result = dict(cursor.fetchone() or {})
+        total = result.get("total_trades", 0)
+        result["win_rate"] = (result["winning_trades"] / total) if total else 0.0
+        return result
 
     def cleanup_old_data(self, days: int = 90):
         """Delete old data to manage database size."""

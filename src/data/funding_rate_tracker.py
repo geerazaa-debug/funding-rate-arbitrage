@@ -45,16 +45,22 @@ class FundingRateDifferential:
 class FundingRateTracker:
     """Central hub for tracking funding rates and calculating differentials."""
 
-    def __init__(self, symbols: list[str], max_history: int = 480):
+    def __init__(self, symbols: list[str], max_history: int = 480,
+                 large_differential_threshold: float = 0.001):
         """
         Initialize tracker.
 
         Args:
             symbols: List of trading pairs (e.g., ["BTCUSDT", "ETHUSDT"])
             max_history: Max funding rates to keep in memory per symbol/exchange (8h * 60min)
+            large_differential_threshold: Absolute differential that raises an
+                opportunity alert. Defaults to 0.001 (0.1%), matching
+                config.json. The previous hardcoded 0.10 was 100x too large for
+                funding rates that run around 0.0001, so the alert never fired.
         """
         self.symbols = symbols
-        self.max_history = max_history
+        self._max_history = max_history
+        self.large_differential_threshold = large_differential_threshold
         self.rest_hub = RESTAPIHub()
 
         # In-memory caches: symbol -> deque of FundingRate
@@ -73,6 +79,28 @@ class FundingRateTracker:
 
         self.alerts_triggered = []
         logger.info(f"Initialized tracker for {len(symbols)} symbols")
+
+    @property
+    def max_history(self) -> int:
+        """Maximum rates retained per symbol/exchange."""
+        return self._max_history
+
+    @max_history.setter
+    def max_history(self, value: int):
+        """
+        Resize the retention window.
+
+        A deque's maxlen is fixed at construction, so assigning to a plain
+        attribute silently did nothing. Rebuilding the deques here keeps the
+        public attribute honest.
+        """
+        self._max_history = value
+        self.bybit_rates = {
+            s: deque(d, maxlen=value) for s, d in self.bybit_rates.items()
+        }
+        self.binance_rates = {
+            s: deque(d, maxlen=value) for s, d in self.binance_rates.items()
+        }
 
     async def process_websocket_message(self, message: Dict, exchange: str):
         """Process incoming WebSocket message."""
@@ -171,7 +199,7 @@ class FundingRateTracker:
     async def _check_alerts(self, symbol: str, diff: FundingRateDifferential):
         """Check for trading alerts."""
         # Alert if differential is large (potential arb)
-        if diff.differential is not None and abs(diff.differential) > 0.10:
+        if diff.differential is not None and abs(diff.differential) > self.large_differential_threshold:
             alert = f"Large differential detected for {symbol}: {diff.differential:.6f}"
             logger.warning(alert)
             self.alerts_triggered.append(alert)

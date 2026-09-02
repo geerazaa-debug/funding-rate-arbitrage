@@ -65,12 +65,12 @@ class PaperTrader:
 
         # Determine which exchange has higher funding
         if differential.differential > 0:
-            # Binance funding is higher → SHORT Binance, LONG Bybit
+            # Binance funding is higher -> SHORT Binance, LONG Bybit
             logger.info(f"[{symbol}] Opportunity: Binance ${abs_diff:.6f} higher")
             bybit_side = OrderSide.LONG
             binance_side = OrderSide.SHORT
         else:
-            # Bybit funding is higher → SHORT Bybit, LONG Binance
+            # Bybit funding is higher -> SHORT Bybit, LONG Binance
             logger.info(f"[{symbol}] Opportunity: Bybit ${abs_diff:.6f} higher")
             bybit_side = OrderSide.SHORT
             binance_side = OrderSide.LONG
@@ -137,7 +137,7 @@ class PaperTrader:
             return True
 
         if (entry_diff > 0 and current_differential <= 0) or (entry_diff < 0 and current_differential >= 0):
-            logger.info(f"[{symbol}] Differential reversed: {entry_diff:.6f} → {current_differential:.6f}")
+            logger.info(f"[{symbol}] Differential reversed: {entry_diff:.6f} -> {current_differential:.6f}")
             return True
 
         if abs(current_differential) < self.config.min_differential_threshold / 2:

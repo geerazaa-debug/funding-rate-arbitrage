@@ -41,7 +41,7 @@ class CircuitBreaker:
 
         self.daily_loss_reset_time = time.time() + 86400  # Reset daily loss after 24h
 
-        logger.info(f"Initialized circuit breaker: max_daily_loss=${config.max_daily_loss_usd}")
+        logger.info(f"Initialized circuit breaker: max_daily_loss=${self.config.max_daily_loss_usd}")
 
     def check_trade_allowed(self, current_capital: float) -> bool:
         """Check if trading is allowed given current state."""
@@ -99,7 +99,7 @@ class CircuitBreaker:
             breaches.append(f"Consecutive losses: {self.consecutive_losses} >= {self.config.consecutive_losses_limit}")
 
         if breaches:
-            logger.error("⚠️ CIRCUIT BREAKER TRIGGERED:")
+            logger.error("CIRCUIT BREAKER TRIGGERED:")
             for breach in breaches:
                 logger.error(f"  - {breach}")
 

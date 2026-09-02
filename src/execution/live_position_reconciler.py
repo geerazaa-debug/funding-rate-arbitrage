@@ -251,7 +251,7 @@ class LivePositionReconciler:
                 print(f"  [{mismatch.severity.upper()}] {mismatch.symbol} on {mismatch.exchange}:")
                 print(f"    Tracked:  {mismatch.tracked_qty} @ ${mismatch.tracked_entry_price:.2f}")
                 print(f"    Actual:   {mismatch.actual_qty} @ ${mismatch.actual_entry_price:.2f}")
-                print(f"    Δ:        {mismatch.difference_pct:.1f}%")
+                print(f"Delta:        {mismatch.difference_pct:.1f}%")
 
         if self.sync_errors:
             print("\nSync Errors:")

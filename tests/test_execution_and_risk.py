@@ -274,11 +274,25 @@ class TestRiskMonitor:
         position_manager = PositionManager()
         monitor = RiskMonitor(10000.0, position_manager)
 
-        checks = await monitor.pre_trade_checks("BTCUSDT", 1.0, 45000.0)
+        # 0.05 BTC @ $45k = $2,250 notional: inside the $10k exposure cap and
+        # well under half of $10k capital at 2x. A full 1 BTC ($45k) would
+        # correctly FAIL both checks, so it cannot be used to assert "all pass".
+        checks = await monitor.pre_trade_checks("BTCUSDT", 0.05, 45000.0)
 
         assert len(checks) > 0
-        # All should pass for first trade
-        assert all(c.passed for c in checks)
+        assert all(c.passed for c in checks), \
+            [f"{c.name}: {c.details}" for c in checks if not c.passed]
+
+    async def test_oversized_trade_is_rejected(self):
+        """The exposure and capital guards must actually bite."""
+        position_manager = PositionManager()
+        monitor = RiskMonitor(10000.0, position_manager)
+
+        checks = await monitor.pre_trade_checks("BTCUSDT", 1.0, 45000.0)
+
+        failed = {c.name for c in checks if not c.passed}
+        assert "PositionExposure" in failed, "$45k notional exceeds the $10k cap"
+        assert "CapitalSufficiency" in failed
 
     def test_trade_recording(self):
         """Test recording trade results."""

@@ -75,7 +75,7 @@ class PositionSizer:
             )
 
         quantity = new_notional / entry_price
-        logger.info(f"Fixed size: ${new_notional:.2f} → {quantity:.4f} units")
+        logger.info(f"Fixed size: ${new_notional:.2f} -> {quantity:.4f} units")
         return quantity
 
     def _volatility_adjusted_size(self, entry_price: float, volatility: float,
@@ -100,7 +100,7 @@ class PositionSizer:
             )
 
         quantity = adjusted_size / entry_price
-        logger.info(f"Vol-adjusted size: vol={volatility:.2%}, ${adjusted_size:.2f} → {quantity:.4f} units")
+        logger.info(f"Vol-adjusted size: vol={volatility:.2%}, ${adjusted_size:.2f} -> {quantity:.4f} units")
         return quantity
 
     def _kelly_size(self, entry_price: float, differential: float,
@@ -141,7 +141,7 @@ class PositionSizer:
             )
 
         quantity = base_size / entry_price
-        logger.info(f"Kelly size: kelly_frac={kelly_frac:.2%}, ${base_size:.2f} → {quantity:.4f} units")
+        logger.info(f"Kelly size: kelly_frac={kelly_frac:.2%}, ${base_size:.2f} -> {quantity:.4f} units")
         return quantity
 
     def can_trade(self, existing_exposure: float) -> bool:

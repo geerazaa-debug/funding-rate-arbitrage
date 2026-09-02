@@ -302,8 +302,11 @@ class TestFundingRateTracker:
 
         await tracker.process_websocket_message(message, "bybit")
 
-        # XYZUSDT should not be tracked
-        assert "XYZUSDT" not in tracker.latest_rates["BTCUSDT"]["bybit"]
+        # An unconfigured symbol must not create tracking state, and must not
+        # contaminate the symbols that are configured.
+        assert "XYZUSDT" not in tracker.latest_rates
+        assert "XYZUSDT" not in tracker.bybit_rates
+        assert tracker.latest_rates["BTCUSDT"]["bybit"] is None
 
     def test_get_all_differentials(self, tracker):
         """Test retrieving all differentials."""
