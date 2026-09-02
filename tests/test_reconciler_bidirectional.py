@@ -169,6 +169,67 @@ class TestScanFailure:
         assert rec.orphans == []
 
 
+class TestBinanceSignHandling:
+    """
+    Binance encodes direction in the sign of positionAmt; Bybit uses an unsigned
+    size plus a side field. Comparing a signed value against a tracked magnitude
+    made every correctly-hedged short read as a 200% mismatch - and every
+    arbitrage has a short leg, so this fired CRITICAL on every cycle.
+    """
+
+    async def test_correctly_hedged_short_is_not_a_mismatch(self):
+        pm = PositionManager()
+        pm.add_position("Binance", "BTCUSDT", OrderSide.SHORT, 1.0, 45000.0)
+        hub = make_hub(bybit_positions=[], binance_positions=BINANCE_LIVE)
+
+        rec = LivePositionReconciler(pm, hub)
+        await rec._reconcile_symbol("BTCUSDT")
+
+        assert rec.mismatches == [], \
+            "a short of the right size in the right direction is not a mismatch"
+
+    async def test_wrong_direction_is_critical(self):
+        """Right size, wrong way round: double the exposure, not a hedge."""
+        pm = PositionManager()
+        pm.add_position("Binance", "BTCUSDT", OrderSide.LONG, 1.0, 45000.0)
+        hub = make_hub(bybit_positions=[], binance_positions=BINANCE_LIVE)
+
+        rec = LivePositionReconciler(pm, hub)
+        status = await rec._reconcile_symbol("BTCUSDT")
+
+        assert status is ReconciliationStatus.CRITICAL
+        assert rec.mismatches[0].severity == "critical"
+
+    async def test_bybit_side_field_is_compared(self):
+        pm = PositionManager()
+        pm.add_position("Bybit", "BTCUSDT", OrderSide.SHORT, 1.0, 45000.0)
+        # Exchange reports a LONG of the same size.
+        hub = make_hub(bybit_positions=BYBIT_LIVE, binance_positions=[])
+
+        rec = LivePositionReconciler(pm, hub)
+        status = await rec._reconcile_symbol("BTCUSDT")
+
+        assert status is ReconciliationStatus.CRITICAL
+
+    async def test_missing_side_field_does_not_manufacture_a_mismatch(self):
+        """
+        An absent direction is unknown, not opposite. Treating it as opposite
+        would fire a false critical on every cycle.
+        """
+        pm = PositionManager()
+        pm.add_position("Bybit", "BTCUSDT", OrderSide.LONG, 1.0, 45000.0)
+        hub = make_hub(
+            bybit_positions=[{"symbol": "BTCUSDT", "size": "1.0", "avgPrice": "45000"}],
+            binance_positions=[],
+        )
+
+        rec = LivePositionReconciler(pm, hub)
+        status = await rec._reconcile_symbol("BTCUSDT")
+
+        assert status is ReconciliationStatus.SYNCED
+        assert rec.mismatches == []
+
+
 class TestCleanState:
     async def test_no_positions_anywhere_is_synced(self):
         pm = PositionManager()

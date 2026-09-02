@@ -153,8 +153,11 @@ class TestLivePositionReconciler:
 
         # Mock exchange responses
         with patch.object(reconciler, "_get_live_position", new_callable=AsyncMock) as mock_get:
+            # `side` included: a real Bybit position response always carries it,
+            # and the reconciler compares direction as well as size.
             mock_get.return_value = {
                 "size": "1.0",
+                "side": "Buy",
                 "avgPrice": "45000"
             }
 

@@ -3,10 +3,15 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, TYPE_CHECKING
 from enum import Enum
 
 from src.utils.logger import setup_logger
+
+if TYPE_CHECKING:
+    # Guarded: position_manager imports from this module at runtime, so a real
+    # import here would be circular.
+    from src.execution.position_manager import PositionManager
 
 logger = setup_logger("order_executor")
 
@@ -198,9 +203,14 @@ class BinanceExecutor(ExchangeExecutor):
 class OrderExecutor:
     """Coordinates dual-exchange order placement for arbitrage."""
 
-    def __init__(self):
+    def __init__(self, position_manager: Optional["PositionManager"] = None):
         self.bybit = BybitExecutor()
         self.binance = BinanceExecutor()
+        # Optional so existing callers keep working. When supplied, a leg that
+        # fills and cannot be flattened is registered here, which makes
+        # PositionManager the single source of truth for live exposure -
+        # emergency exit, the dashboard and reconciliation all read from it.
+        self.position_manager = position_manager
         self.dual_orders: Dict[str, DualExchangeOrder] = {}
         self.failed_orders: List[DualExchangeOrder] = []
         # Legs that filled and could not be flattened. Non-empty means real,
@@ -245,6 +255,7 @@ class OrderExecutor:
                 f"NAKED {order.side.value} {filled} {symbol} REQUIRES MANUAL CLOSE",
                 exc_info=True,
             )
+            self._register_unhedged(symbol, order, filled)
             return False
 
         if not closing:
@@ -252,10 +263,39 @@ class OrderExecutor:
                 f"[{arb_id}] FLATTEN REJECTED on {order.exchange} - "
                 f"NAKED {order.side.value} {filled} {symbol} REQUIRES MANUAL CLOSE"
             )
+            self._register_unhedged(symbol, order, filled)
             return False
 
         logger.info(f"[{arb_id}] {order.exchange} leg flattened: {closing.order_id}")
         return True
+
+    def _register_unhedged(self, symbol: str, order: Order, quantity: float):
+        """
+        Track a leg that filled and could not be closed.
+
+        This is a known fact, not a guess: the order filled and the flatten was
+        rejected, so the position is live. Registering it puts it in front of
+        every consumer of PositionManager - emergency exit will now attempt to
+        close it, the dashboard shows the exposure, and reconciliation sees it
+        as tracked rather than reporting it as an orphan.
+
+        Deliberately NOT done for an unresolved leg, where we do not know whether
+        an order landed; inventing a position there would create a phantom. The
+        reconciler's reverse pass discovers those by asking the exchange.
+        """
+        if self.position_manager is None:
+            return
+        try:
+            self.position_manager.add_position(
+                order.exchange, symbol, order.side, quantity,
+                order.filled_price or order.price or 0.0,
+            )
+            logger.warning(
+                f"[{symbol}] Unhedged {order.side.value} {quantity} on "
+                f"{order.exchange} registered for tracking"
+            )
+        except Exception as e:
+            logger.error(f"[{symbol}] Could not register unhedged position: {e}")
 
     async def place_dual_order(self, symbol: str, bybit_side: OrderSide, binance_side: OrderSide,
                               quantity: float, timeout_ms: float = 5000) -> Optional[DualExchangeOrder]:
