@@ -4,9 +4,12 @@ import time
 import signal
 from pathlib import Path
 
+from datetime import datetime, timezone
+
 from src.utils.logger import setup_logger
 from src.data.websocket_manager import WebSocketHub
 from src.data.funding_rate_tracker import FundingRateTracker
+from src.storage.database import Database
 
 logger = setup_logger("main")
 
@@ -25,7 +28,20 @@ class FundingRateBot:
         self.last_metrics_report = 0
         self.metrics_interval = self.config.get("monitoring", {}).get("metrics_report_interval_s", 30)
 
-        logger.info(f"Initialized bot with pairs: {self.pairs}")
+        # Persistence. Without this a collector run leaves only log lines, and
+        # the question it exists to answer - how often is the spread tradeable -
+        # cannot be queried afterwards.
+        collection = self.config.get("collection", {})
+        self.sample_interval = collection.get("sample_interval_s", 10)
+        self.db = Database(collection.get("db_path", "data/observations.db"))
+        self.db.connect()
+        self.last_sample = 0.0
+        self.samples_written = 0
+
+        logger.info(
+            f"Initialized bot with pairs: {self.pairs} "
+            f"(sampling every {self.sample_interval}s)"
+        )
 
     @staticmethod
     def _load_config(config_path: str) -> dict:
@@ -75,17 +91,46 @@ class FundingRateBot:
         logger.info("Backfill complete")
 
     async def _report_metrics(self):
-        """Periodically report metrics."""
+        """Periodically sample observations to disk and report metrics."""
         while self.is_running:
             try:
                 now = time.time()
+
+                if now - self.last_sample >= self.sample_interval:
+                    self._persist_observations()
+                    self.last_sample = now
+
                 if now - self.last_metrics_report >= self.metrics_interval:
                     self._print_metrics()
                     self.last_metrics_report = now
 
                 await asyncio.sleep(1)
             except Exception as e:
-                logger.error(f"Error reporting metrics: {e}")
+                logger.error(f"Error in sampling loop: {e}")
+
+    def _persist_observations(self):
+        """Write the current differential for each pair to the database."""
+        observed_at = datetime.now(timezone.utc).isoformat()
+
+        for pair in self.pairs:
+            diff = self.tracker.get_latest_differential(pair)
+            # Nothing to learn from a sample where neither exchange has reported.
+            if diff is None or diff.differential is None:
+                continue
+            try:
+                self.db.insert_observation(
+                    observed_at=observed_at,
+                    symbol=pair,
+                    bybit_rate=diff.bybit_rate,
+                    binance_rate=diff.binance_rate,
+                    differential=diff.differential,
+                    bybit_age_s=diff.bybit_age_s,
+                    binance_age_s=diff.binance_age_s,
+                )
+                self.samples_written += 1
+            except Exception as e:
+                # A storage failure must not take down a long collection run.
+                logger.error(f"[{pair}] Failed to persist observation: {e}")
 
     def _print_metrics(self):
         """Print current metrics to console."""
@@ -97,6 +142,7 @@ class FundingRateBot:
 
         ws_status = self.websocket_hub.get_status()
         print(f"WebSocket Status: Bybit={ws_status['bybit']}, Binance={ws_status['binance']}")
+        print(f"Samples persisted: {self.samples_written}")
 
         for pair in self.pairs:
             diff = differentials.get(pair)
@@ -163,6 +209,15 @@ class FundingRateBot:
 
         await self.websocket_hub.stop()
         await self.tracker.close()
+
+        # Take a final sample so a run is not truncated mid-interval, then close
+        # the database so the collected data is flushed and readable.
+        try:
+            self._persist_observations()
+            self.db.disconnect()
+            logger.info(f"Collection complete: {self.samples_written} samples persisted")
+        except Exception as e:
+            logger.error(f"Error closing database: {e}")
 
         logger.info("Shutdown complete")
 

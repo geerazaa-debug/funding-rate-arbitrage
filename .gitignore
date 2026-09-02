@@ -4,9 +4,14 @@ __pycache__/
 venv/
 *.log
 *.db
-*.json
+logs/
+
+# Secrets only. A blanket *.json rule previously excluded config/config.json
+# too, so a fresh clone had no configuration at all.
 config/secrets.json
 config/api_keys.json
+*secrets*.json
+*credentials*.json
 .env
 .env.*
 !.env.example

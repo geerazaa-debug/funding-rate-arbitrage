@@ -88,6 +88,31 @@ class Database:
             )
         """)
 
+        # Observed funding rates and the resulting differential.
+        #
+        # Distinct from the `funding` table, which records funding actually PAID
+        # on a position. This one is the research dataset: a time series of what
+        # the two exchanges were quoting, used to answer how often a tradeable
+        # spread appears at all. Without it a collector run leaves nothing behind
+        # but log lines.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS funding_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_at TIMESTAMP NOT NULL,
+                symbol TEXT NOT NULL,
+                bybit_rate REAL,
+                binance_rate REAL,
+                differential REAL,
+                bybit_age_s REAL,
+                binance_age_s REAL
+            )
+        """)
+        # Analysis is almost always "this symbol, over this window".
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_obs_symbol_time
+            ON funding_observations (symbol, observed_at)
+        """)
+
         # Funding table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS funding (
@@ -192,6 +217,57 @@ class Database:
 
         logger.debug(f"Position upserted: {position.symbol} on {position.exchange}")
         return cursor.lastrowid
+
+    def insert_observation(self, observed_at, symbol: str, bybit_rate, binance_rate,
+                          differential, bybit_age_s=None, binance_age_s=None) -> int:
+        """Record one funding-rate observation for later analysis."""
+        cursor = self.connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO funding_observations
+                (observed_at, symbol, bybit_rate, binance_rate, differential,
+                 bybit_age_s, binance_age_s)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (observed_at, symbol, bybit_rate, binance_rate, differential,
+             bybit_age_s, binance_age_s),
+        )
+        self.connection.commit()
+        return cursor.lastrowid
+
+    def get_observation_stats(self, symbol: str, threshold: float) -> Dict:
+        """
+        Summarise collected observations for one symbol.
+
+        `threshold` is the absolute differential at which a trade would be worth
+        opening; the counts answer the question the collector exists to answer -
+        how much of the time is the spread actually tradeable.
+        """
+        cursor = self.connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) as samples,
+                COALESCE(AVG(ABS(differential)), 0.0) as avg_abs_diff,
+                COALESCE(MAX(ABS(differential)), 0.0) as max_abs_diff,
+                COALESCE(MIN(ABS(differential)), 0.0) as min_abs_diff,
+                COALESCE(SUM(CASE WHEN ABS(differential) >= ? THEN 1 ELSE 0 END), 0)
+                    as tradeable_samples,
+                MIN(observed_at) as first_seen,
+                MAX(observed_at) as last_seen
+            FROM funding_observations
+            WHERE symbol = ? AND differential IS NOT NULL
+            """,
+            (threshold, symbol),
+        )
+        row = dict(cursor.fetchone() or {})
+        samples = row.get("samples", 0)
+        row["symbol"] = symbol
+        row["threshold"] = threshold
+        row["tradeable_pct"] = (
+            row["tradeable_samples"] / samples * 100 if samples else 0.0
+        )
+        return row
 
     def delete_position(self, symbol: str, exchange: str) -> bool:
         """
