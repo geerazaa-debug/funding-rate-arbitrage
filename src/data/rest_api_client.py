@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 
 from src.utils.logger import setup_logger
+from src.utils.http import make_session
 
 logger = setup_logger("rest_api_client")
 
@@ -22,7 +23,7 @@ class RESTAPIClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = make_session()
         return self.session
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> Optional[Dict]:
@@ -71,7 +72,9 @@ class BybitRESTClient(RESTAPIClient):
     async def get_funding_rates(self, symbol: str, limit: int = 100) -> Optional[List[Dict]]:
         """Fetch funding rate history from Bybit."""
         try:
-            params = {"symbol": symbol, "limit": limit}
+            # `category` is mandatory on Bybit v5; omitting it returns
+            # retCode 10001 "Illegal category". USDT perpetuals are "linear".
+            params = {"category": "linear", "symbol": symbol, "limit": limit}
             data = await self._request("GET", "/v5/market/funding/history", params=params)
 
             if data and data.get("retCode") == 0:

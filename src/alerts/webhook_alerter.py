@@ -6,6 +6,7 @@ from enum import Enum
 from dataclasses import dataclass
 
 from src.utils.logger import setup_logger
+from src.utils.http import make_session
 
 logger = setup_logger("webhook_alerter")
 
@@ -77,7 +78,7 @@ class WebhookAlerter:
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create session."""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = make_session()
         return self.session
 
     async def send_alert(self, alert: Alert, services: Optional[List[str]] = None) -> bool:

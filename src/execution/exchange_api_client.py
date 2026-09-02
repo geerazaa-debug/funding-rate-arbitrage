@@ -9,6 +9,7 @@ from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlencode
 
 from src.utils.logger import setup_logger
+from src.utils.http import make_session
 
 logger = setup_logger("exchange_api_client")
 
@@ -29,7 +30,7 @@ class AuthenticatedExchangeClient(ABC):
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create session."""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = make_session()
         return self.session
 
     @abstractmethod

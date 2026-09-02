@@ -8,6 +8,14 @@ venv/
 config/secrets.json
 config/api_keys.json
 .env
+.env.*
+!.env.example
+
+# Ad-hoc scripts that touch live credentials. These get written quickly during
+# debugging and are exactly the files that leak keys into history.
+check_live_api.py
+scratch_*.py
+_*.py
 .idea/
 .vscode/
 *.egg-info/
