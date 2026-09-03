@@ -113,6 +113,27 @@ class Database:
             ON funding_observations (symbol, observed_at)
         """)
 
+        # Additive migration. Funding intervals are NOT uniformly 8h - roughly
+        # half of all pairs settle every 4h, and the interval can differ between
+        # venues for the same symbol. Comparing a 4h rate against an 8h rate
+        # invents an arbitrage that does not exist, so the interval must be
+        # recorded and the differential normalised to a common basis.
+        #
+        # Added rather than baked into CREATE TABLE so databases from earlier
+        # runs keep working; their rows simply carry NULL here.
+        existing = {row[1] for row in cursor.execute(
+            "PRAGMA table_info(funding_observations)")}
+        for column, decl in (
+            ("bybit_interval_h", "REAL"),
+            ("binance_interval_h", "REAL"),
+            ("differential_8h", "REAL"),
+        ):
+            if column not in existing:
+                cursor.execute(
+                    f"ALTER TABLE funding_observations ADD COLUMN {column} {decl}"
+                )
+                logger.info(f"Migrated funding_observations: added {column}")
+
         # Funding table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS funding (
@@ -234,6 +255,31 @@ class Database:
         )
         self.connection.commit()
         return cursor.lastrowid
+
+    def insert_observations_bulk(self, rows: List[tuple]) -> int:
+        """
+        Insert many observations in a single transaction.
+
+        Row order: (observed_at, symbol, bybit_rate, binance_rate, differential,
+                    bybit_interval_h, binance_interval_h, differential_8h)
+
+        Committing per row costs an fsync each time; at ~100 symbols per cycle
+        that dominates the cycle. One transaction per cycle instead.
+        """
+        if not rows:
+            return 0
+        cursor = self.connection.cursor()
+        cursor.executemany(
+            """
+            INSERT INTO funding_observations
+                (observed_at, symbol, bybit_rate, binance_rate, differential,
+                 bybit_interval_h, binance_interval_h, differential_8h)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self.connection.commit()
+        return len(rows)
 
     def get_observation_stats(self, symbol: str, threshold: float) -> Dict:
         """
