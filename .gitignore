@@ -20,9 +20,16 @@ config/api_keys.json
 # pasted inline, and are exactly the files that leak keys into history.
 # scripts/preflight.py is deliberately NOT here: it reads everything from .env
 # and is meant to be tracked and shared.
+#
+# _*.py also matched __init__.py (leading double-underscore), which silently
+# excluded every NEW package's __init__.py from git - discovered when
+# src/analysis/__init__.py needed `git add -f` to be tracked at all. The
+# negation below only restores dunder files; single-underscore scratch names
+# (_scratch.py, _debug.py) are still ignored.
 check_live_api.py
 scratch_*.py
 _*.py
+!__*.py
 .idea/
 .vscode/
 *.egg-info/

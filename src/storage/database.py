@@ -288,17 +288,26 @@ class Database:
         `threshold` is the absolute differential at which a trade would be worth
         opening; the counts answer the question the collector exists to answer -
         how much of the time is the spread actually tradeable.
+
+        Uses differential_8h (interval-normalised), falling back to raw
+        differential only for rows recorded before that column existed. Roughly
+        half of all pairs settle every 4h rather than 8h, and the interval can
+        differ between venues for the same symbol - comparing raw differential
+        across symbols (or against a threshold meant for an 8h basis) invents an
+        edge that is not really there whenever intervals don't match. This was
+        previously using raw differential unconditionally; fixed as part of
+        making cross-symbol ranking correct (see src/analysis/funding_edge.py).
         """
         cursor = self.connection.cursor()
         cursor.execute(
             """
             SELECT
                 COUNT(*) as samples,
-                COALESCE(AVG(ABS(differential)), 0.0) as avg_abs_diff,
-                COALESCE(MAX(ABS(differential)), 0.0) as max_abs_diff,
-                COALESCE(MIN(ABS(differential)), 0.0) as min_abs_diff,
-                COALESCE(SUM(CASE WHEN ABS(differential) >= ? THEN 1 ELSE 0 END), 0)
-                    as tradeable_samples,
+                COALESCE(AVG(ABS(COALESCE(differential_8h, differential))), 0.0) as avg_abs_diff,
+                COALESCE(MAX(ABS(COALESCE(differential_8h, differential))), 0.0) as max_abs_diff,
+                COALESCE(MIN(ABS(COALESCE(differential_8h, differential))), 0.0) as min_abs_diff,
+                COALESCE(SUM(CASE WHEN ABS(COALESCE(differential_8h, differential)) >= ?
+                    THEN 1 ELSE 0 END), 0) as tradeable_samples,
                 MIN(observed_at) as first_seen,
                 MAX(observed_at) as last_seen
             FROM funding_observations
@@ -314,6 +323,28 @@ class Database:
             row["tradeable_samples"] / samples * 100 if samples else 0.0
         )
         return row
+
+    def get_distinct_symbols(self, min_samples: int = 1) -> List[Dict]:
+        """
+        Every symbol that actually has collected observations, with its sample
+        count - the real universe to analyse, instead of a static config list
+        that may not match what was actually collected (e.g. a `--top 100`
+        collector run gathers far more symbols than the 1-2 in config.json's
+        `pairs`, and analysis limited to `pairs` silently ignores the rest).
+        """
+        cursor = self.connection.cursor()
+        cursor.execute(
+            """
+            SELECT symbol, COUNT(*) as samples
+            FROM funding_observations
+            WHERE differential IS NOT NULL
+            GROUP BY symbol
+            HAVING COUNT(*) >= ?
+            ORDER BY samples DESC
+            """,
+            (min_samples,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     def delete_position(self, symbol: str, exchange: str) -> bool:
         """

@@ -30,5 +30,16 @@
     "db_path": "data/observations.db",
     "sample_interval_s": 10,
     "tradeable_threshold": 0.0005
+  },
+  "fees": {
+    "_comment": "Fractional rates matching funding_observations.differential_8h's units - 0.0005 means a 0.05% taker fee, NOT 0.05. Standard base-tier rates; override to your actual VIP/fee-token tier.",
+    "bybit_taker_fee_pct": 0.00055,
+    "binance_taker_fee_pct": 0.0005
+  },
+  "analysis": {
+    "_comment": "max_holding_periods is in 8h-normalised funding periods (3 = ~24h). A position held longer amortises the fixed round-trip fee cost across more funding capture, so a thinner differential can still be profitable - see src/analysis/funding_edge.py.",
+    "max_holding_periods": 3,
+    "min_samples_for_ranking": 30,
+    "top_n_to_display": 20
   }
 }
