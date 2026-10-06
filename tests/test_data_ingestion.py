@@ -419,6 +419,8 @@ class TestIntegration:
         diff = tracker.get_latest_differential("BTCUSDT")
         assert diff.bybit_age_s > diff.binance_age_s  # Bybit was added first
         assert diff.bybit_age_s > 0
-        assert diff.binance_age_s > 0
+        # Binance's age is measured from the message's own event time, which this test
+        # sets to 'now', so it can legitimately be 0.0 at clock resolution.
+        assert diff.binance_age_s >= 0
 
         await tracker.close()
